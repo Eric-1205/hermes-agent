@@ -160,6 +160,8 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._listen_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._heartbeat_interval: float = 30.0  # seconds, updated by Hello
+        self._heartbeat_ack_missed: int = 0  # consecutive missed ACKs (P0 fix)
+        self._heartbeat_ack_threshold: int = 3  # max missed ACKs before forced reconnect (P0 fix)
         self._session_id: Optional[str] = None
         self._last_seq: Optional[int] = None
         self._chat_type_map: Dict[str, str] = {}  # chat_id → "c2c"|"group"|"guild"|"dm"
@@ -315,7 +317,11 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         proxy_vars = ("WSS_PROXY", "wss_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
         ws_proxy = next((v for v in map(os.getenv, proxy_vars) if v), None)
         self._ws = await self._session.ws_connect(
-            gateway_url, headers={"User-Agent": build_user_agent()}, timeout=CONNECT_TIMEOUT_SECONDS, proxy=ws_proxy,
+            gateway_url,
+            headers={"User-Agent": build_user_agent()},
+            timeout=CONNECT_TIMEOUT_SECONDS,
+            proxy=ws_proxy,
+            heartbeat=30.0,  # P1 fix: aiohttp protocol-level ping/pong for proxy/NAT keepalive
         )
         logger.info("[%s] WebSocket connected to %s", self._log_tag, gateway_url)
 
@@ -419,6 +425,7 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         await asyncio.sleep(delay)
 
         self._heartbeat_interval = 30.0  # reset until Hello
+        self._heartbeat_ack_missed = 0  # reset ACK counter on reconnect (P0 fix)
         try:
             await self._open_gateway_ws()
             self._mark_connected()
@@ -437,7 +444,12 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             raise RuntimeError("WebSocket closed")
 
         while self._running and self._ws and not self._ws.closed:
-            msg = await self._ws.receive()
+            # P0 fix: timeout so half-open connections raise instead of blocking forever.
+            # 3× heartbeat interval ≈ 72s, well below the server's ~30min session timeout.
+            msg = await asyncio.wait_for(
+                self._ws.receive(),
+                timeout=self._heartbeat_interval * 3,
+            )
             if msg.type == aiohttp.WSMsgType.TEXT:
                 payload = self._parse_json(msg.data)
                 if payload:
@@ -448,7 +460,13 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 raise RuntimeError("WebSocket closed")
 
     async def _heartbeat_loop(self) -> None:
-        """Send op 1 heartbeats with the latest seq at 80% of the Hello interval."""
+        """Send op 1 heartbeats with the latest seq at 80% of the Hello interval.
+
+        P0 fix: tracks ACK misses and forces reconnect when threshold exceeded,
+        so half-open connections are detected in ~72s instead of ~30min.
+        P3: emits a periodic health summary at ~5min intervals for observability.
+        """
+        _health_log_counter = 0  # P3: log health summary every ~12 ticks (12×24s ≈ 5min)
         with contextlib.suppress(asyncio.CancelledError):
             while self._running:
                 await asyncio.sleep(self._heartbeat_interval)
@@ -456,8 +474,29 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                     continue
                 try:
                     await self._ws.send_json({"op": 1, "d": self._last_seq})
+                    self._heartbeat_ack_missed += 1
+                    if self._heartbeat_ack_missed >= self._heartbeat_ack_threshold:
+                        logger.warning(
+                            "[%s] Heartbeat ACK missed %d times, forcing reconnect",
+                            self._log_tag, self._heartbeat_ack_missed)
+                        self._close_ws_soon()
+                        self._heartbeat_ack_missed = 0
                 except Exception as exc:
-                    logger.debug("[%s] Heartbeat failed: %s", self._log_tag, exc)
+                    logger.warning("[%s] Heartbeat send failed: %s", self._log_tag, exc)
+                    self._heartbeat_ack_missed += 1
+                    if self._heartbeat_ack_missed >= self._heartbeat_ack_threshold:
+                        logger.warning(
+                            "[%s] Heartbeat send failed %d times, forcing reconnect",
+                            self._log_tag, self._heartbeat_ack_missed)
+                        self._close_ws_soon()
+                        self._heartbeat_ack_missed = 0
+                # P3: periodic health summary
+                _health_log_counter += 1
+                if _health_log_counter % 12 == 0:
+                    logger.info(
+                        "[%s] WS health: ack_missed=%d, ws_closed=%s, seq=%s",
+                        self._log_tag, self._heartbeat_ack_missed,
+                        self._ws.closed if self._ws else True, self._last_seq)
 
     async def _send_ws_auth(self, name: str, payload: Dict[str, Any], sent_msg: str, *log_args) -> bool:
         """Send an Identify/Resume payload; returns False if the send raised."""
@@ -534,8 +573,10 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 self._create_task(self._on_interaction(d))
             else:
                 logger.debug("[%s] Unhandled dispatch: %s", self._log_tag, t)
-        elif op == 11:  # Heartbeat ACK
-            pass
+        elif op == 11:  # Heartbeat ACK — reset miss counter (P0 fix)
+            if self._heartbeat_ack_missed > 0:
+                logger.debug("[%s] Heartbeat ACK received (missed was %d)", self._log_tag, self._heartbeat_ack_missed)
+            self._heartbeat_ack_missed = 0
         elif op == 7:  # Server Reconnect
             logger.info("[%s] Server requested reconnect (op 7)", self._log_tag)
             self._close_ws_soon()

@@ -4650,6 +4650,35 @@ def _housekeeping_chore(label: str, fn, *args, **kwargs) -> None:
         logger.debug("%s error: %s", label, exc)
 
 
+def _housekeeping_ws_health(adapters, loop) -> None:
+    """P1 fix: check that heartbeat tasks are alive for WS-based adapters (qqbot).
+
+    If a heartbeat task died (non-CancelledError exit), restart it so half-open
+    connections are still detected. Runs every 5 ticks (~5 min).
+    """
+    if not adapters or loop is None:
+        return
+    for platform, adapter in adapters.items():
+        hb_task = getattr(adapter, "_heartbeat_task", None)
+        if hb_task is not None and hb_task.done():
+            exc = hb_task.exception()
+            if exc is not None:
+                logger.warning("[%s] Heartbeat task died: %s — restarting", getattr(adapter, "_log_tag", platform), exc)
+            else:
+                logger.warning("[%s] Heartbeat task ended unexpectedly — restarting", getattr(adapter, "_log_tag", platform))
+            try:
+                fut = safe_schedule_threadsafe(
+                    _restart_heartbeat(adapter), loop, logger=logger,
+                    log_message="Heartbeat restart scheduling error")
+            except Exception:
+                logger.debug("Heartbeat restart for %s failed", platform)
+
+
+async def _restart_heartbeat(adapter) -> None:
+    """Restart the heartbeat task on the gateway loop."""
+    adapter._heartbeat_task = asyncio.create_task(adapter._heartbeat_loop())
+
+
 def _housekeeping_channel_directory(adapters, loop) -> None:
     from gateway.channel_directory import build_channel_directory
     if loop is not None:
@@ -4864,6 +4893,7 @@ def _start_gateway_housekeeping(
         chores.append((1, DRAIN_LABEL, lambda: _drain_restart_safe_cron_deliveries(adapters, loop, runner)))
     chores += [
         (5, "Channel directory refresh", lambda: adapters and _housekeeping_channel_directory(adapters, loop)),
+        (5, "WS heartbeat health check", lambda: adapters and _housekeeping_ws_health(adapters, loop)),  # P1 fix
         (60, "Media cache cleanup", _housekeeping_media_caches),
         (60, "Paste sweep", _housekeeping_paste_sweep)]
     if cron_provider is not None:
