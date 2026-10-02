@@ -1836,8 +1836,26 @@ def restart() -> None:
     ``start()``'s "already running" guard sees the draining process and no-ops, and nothing
     replaces it when it exits (a silent outage). Fails loudly on either side."""
     _assert_windows()
+    from hermes_constants import get_hermes_home
 
     stop()
+
+    # CLI-driven restart parity with in-gateway request_restart(): the planned-restart marker
+    # makes the NEXT gateway boot send the "♻️ Gateway online" home-channel notice. Without it
+    # a `hermes gateway restart` (or the desktop restart button, which spawns this command)
+    # stopped-side sent a shutdown notice but the fresh gateway booted silently — the notice
+    # only fired for chat /restart and update-driven restarts. Best-effort: never block the
+    # restart on the marker write.
+    try:
+        from utils import atomic_json_write
+
+        atomic_json_write(
+            get_hermes_home() / ".restart_pending.json",
+            {"requested_at": time.time(), "via_service": False, "detached": False},
+            indent=None,
+        )
+    except Exception:
+        pass
 
     if not _wait_for_gateway_absent(timeout_s=30.0):
         print("⚠ Gateway still present after stop; forcing termination before restart...")
