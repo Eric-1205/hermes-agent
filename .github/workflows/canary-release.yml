@@ -29,7 +29,13 @@ jobs:
     name: Tag, draft, and start the canary build
     runs-on: blacksmith-4vcpu-ubuntu-2404
     # A dispatch from a feature branch would tag unmerged code as the canary.
-    if: github.ref_name == github.event.repository.default_branch
+    # Only the owner repo may publish: the R2 channel records are signed for
+    # NousResearch/hermes-agent, so any fork's validate_record() rejects with
+    # "Channel repository authority mismatch" and the scheduled run burns
+    # Actions minutes failing every day.
+    if: >-
+      github.repository_owner == 'NousResearch' &&
+      github.ref_name == github.event.repository.default_branch
     steps:
       - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
         with:
@@ -54,7 +60,11 @@ jobs:
     # Prune even when this run had nothing new to tag. The desktop build
     # runs in its own workflow run, so this does not wait on it — the
     # window is 14 days, far wider than any build.
-    if: always() && needs.tag.result != 'cancelled' && needs.tag.result != 'skipped'
+    # Forks have no canaries to prune (the tag job above never runs there),
+    # and prune targets this repo's own releases only.
+    if: >-
+      always() && github.repository_owner == 'NousResearch' &&
+      needs.tag.result != 'cancelled' && needs.tag.result != 'skipped'
     # Job-level so the R2 prune step can gate on `env` (a step `if` cannot
     # read `secrets`): an unprovisioned release-signing environment skips
     # the R2 prune instead of failing the canary run.
